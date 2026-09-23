@@ -1,0 +1,176 @@
+# Install required libraries if not already present in Colab environment
+!pip install trimesh ezdxf numpy rtree
+
+import numpy as np
+import trimesh
+import ezdxf
+
+# =====================================================================
+# 1. SYSTEM CONFIGURATION & DIRECTORIES (Updated for Section 7)
+# =====================================================================
+STL_FILE_PATH = "hemisphere_75mm_with_hole.stl"
+DXF_FILE_PATH = "toolpath_lines.dxf"
+OUTPUT_GCODE = "non_planar_toolpath.gcode"
+
+# Slicing & Machine Dynamics
+RETRACT_HEIGHT = 2.5       # Relative Z-lift above toolpath surface (mm)
+PAUSE_TIME = 10            # Dwell duration at boundaries (seconds)
+PRINT_FEEDRATE = 1200      # Conformal XY linear printing speed (mm/min)
+TRAVEL_FEEDRATE = 250      # Z-axis retraction/approach velocity (mm/min)
+SAMPLED_SPACING = 0.2      # Step size to discretize DXF paths linearly (mm)
+
+# Proximity Ceiling & Kinematic Boundaries (Section 7.4)
+SKIN_DEPTH_TOLERANCE = 0.3 # Maximum depth (mm) allowed before triggering void sequence
+MAX_SLOPE_ANGLE = 45.0      # Hard physical boundary cut-off for steep flanks (degrees)
+
+# =====================================================================
+# 2. FILE LOADING AND DATA EXTRACTION
+# =====================================================================
+print("[1/4] Processing asset files...")
+mesh = trimesh.load_mesh(STL_FILE_PATH)
+doc = ezdxf.readfile(DXF_FILE_PATH)
+msp = doc.modelspace()
+
+# Isolate the scalar maximum Z index value from the bounding box
+max_mesh_z = float(mesh.bounds[1][2])
+ray_start_z = max_mesh_z + 20.0  # Safe clearance offset (20mm)
+
+# Initialize high-speed proximity query tree for mesh faces
+proximity_query = trimesh.proximity.ProximityQuery(mesh)
+
+# =====================================================================
+# 3. INTERSECTOR FUNCTION (Updated for Normal Vector & Slope Checking)
+# =====================================================================
+def get_surface_z(x, y):
+    """ Casts a vertical downward ray to locate the highest mesh surface and evaluates local slope. """
+    ray_origin = [[float(x), float(y), float(ray_start_z)]]
+    ray_direction = [[0.0, 0.0, -1.0]]
+
+    # Perform intersection query extracting the hit location and triangle indexes
+    locations, _, index_tri = mesh.ray.intersects_location(
+        ray_origins=ray_origin, ray_directions=ray_direction
+    )
+
+    if len(locations) == 0:
+        return None, 1.0, False
+
+    highest_idx = np.argmax(locations[:, 2])
+    z_surface = float(locations[highest_idx][2])
+    
+    # --- HARD SLOPE BOUNDARY GUARD (Section 7.1 & 7.4) ---
+    hit_triangle_idx = index_tri[highest_idx]
+    face_normal = mesh.face_normals[hit_triangle_idx]
+    
+    # cos(theta) = n_z (absolute value accounts for inverted normal conventions)
+    cos_theta = abs(face_normal[2]) 
+    theta_rad = np.arccos(np.clip(cos_theta, 0.0, 1.0))
+    theta_deg = np.degrees(theta_rad)
+    
+    # Calculate geometric distortion factor M = sec(theta)
+    M = 1.0 / cos_theta if cos_theta > 0 else float('inf')
+
+    # If the surface normal angle exceeds our maximum physical clearance angle, prune it
+    if theta_deg > MAX_SLOPE_ANGLE:
+        return None, M, False
+
+    return z_surface, M, True
+
+# =====================================================================
+# 4. G-CODE PARSING LOOP WITH ADVANCED SAFARDS
+# =====================================================================
+print("[2/4] Slicing lines and computing 3D mesh surface intersections...")
+gcode_output = [
+    "; --- Universal Non-Planar Initialization ---",
+    "G21 ; Set units to millimeters",
+    "G90 ; Use Absolute Positioning mode"
+]
+
+dxf_lines = []
+for entity in msp.query('LINE LWPOLYLINE'):
+    if entity.dxftype() == 'LINE':
+        dxf_lines.append([(entity.dxf.start.x, entity.dxf.start.y), (entity.dxf.end.x, entity.dxf.end.y)])
+    elif entity.dxftype() == 'LWPOLYLINE':
+        points = entity.get_points()
+        for i in range(len(points) - 1):
+            dxf_lines.append([(points[i][0], points[i][1]), (points[i+1][0], points[i+1][1])])
+
+print(f"[3/4] Compiling G-code structures for {len(dxf_lines)} vector segments...")
+
+for index, line in enumerate(dxf_lines):
+    gcode_output.append(f"\n; --- START DXF TRACK ELEMENT {index + 1} ---")
+    start_pt, end_pt = np.array(line[0]), np.array(line[1])
+    vector = end_pt - start_pt
+    segment_length = np.linalg.norm(vector)
+
+    if segment_length == 0:
+        continue
+
+    steps = int(np.ceil(segment_length / SAMPLED_SPACING))
+    t_steps = np.linspace(0, 1, max(steps, 2))
+
+    is_inside_void = True
+    has_initialized_track = False
+    last_valid_z = max_mesh_z
+
+    for t in t_steps:
+        curr_xy = start_pt + t * vector
+        # Apply machine-specific sign conversions here if required by hardware mapping
+        x, y = float(curr_xy[0]), float(curr_xy[1])
+
+        # Fetch surface intersection data including the distortion scaling multiplier M
+        z_surface, M, hits_geometry = get_surface_z(x, y)
+
+        # --- PROXIMITY CEILING CHECK ---
+        if hits_geometry:
+            closest_pts, _, _ = proximity_query.on_surface([[x, y, z_surface]])
+            closest_mesh_z = float(closest_pts[0][2])
+
+            # If the calculated ray Z drops deeper than our tolerance ceiling below
+            # the closest actual model surface point, we are sliding down an unwanted interior wall.
+            if (closest_mesh_z - z_surface) > SKIN_DEPTH_TOLERANCE:
+                hits_geometry = False
+
+        if hits_geometry:
+            last_valid_z = z_surface
+
+            # --- DYNAMIC FEEDRATE COMPENSATION (Section 7.3) ---
+            # Decreases toolhead linear velocity proportionally over sloped profiles 
+            # to maintain steady carbon fiber volumetric/areal density.
+            adjusted_print_feedrate = PRINT_FEEDRATE / M
+
+            if not has_initialized_track:
+                gcode_output.append(f"G0 X{x:.3f} Y{y:.3f} Z{z_surface + RETRACT_HEIGHT:.3f} ; Safe overhead hover")
+                gcode_output.append(f"G1 Z{z_surface:.3f} F{TRAVEL_FEEDRATE} ; Lower into print contact height")
+                has_initialized_track = True
+                is_inside_void = False
+
+            if is_inside_void:
+                gcode_output.append("; Void exit edge hit -> Lowering to profile")
+                gcode_output.append(f"G1 X{x:.3f} Y{y:.3f} Z{z_surface:.3f} F{TRAVEL_FEEDRATE}")
+                is_inside_void = False
+            else:
+                gcode_output.append(f"G1 X{x:.3f} Y{y:.3f} Z{z_surface:.3f} F{adjusted_print_feedrate:.1f} ; Compounded feedrate for M={M:.3f}")
+        else:
+            # --- VOID / PLUNGE / STEEP SLOPE MITIGATION RETRACTION ---
+            if not is_inside_void and has_initialized_track:
+                gcode_output.append("; Hole or steep slope boundary reached - Interrupted path sequence")
+                gcode_output.append(f"G1 Z{last_valid_z + RETRACT_HEIGHT:.3f} F{TRAVEL_FEEDRATE}")
+                gcode_output.append(f"G4 S{PAUSE_TIME}")
+                is_inside_void = True
+
+            if has_initialized_track:
+                gcode_output.append(f"G0 X{x:.3f} Y{y:.3f} Z{last_valid_z + RETRACT_HEIGHT:.3f}")
+
+    if has_initialized_track:
+        gcode_output.append("; End of line reached - Termination sequence")
+        gcode_output.append(f"G1 Z{last_valid_z + RETRACT_HEIGHT:.3f} F{TRAVEL_FEEDRATE}")
+        gcode_output.append(f"G4 S{PAUSE_TIME}")
+
+# =====================================================================
+# 5. DATA EXPORT
+# =====================================================================
+print(f"[4/4] Writing configuration blocks directly to file...")
+with open(OUTPUT_GCODE, "w") as file:
+    file.write("\n".join(gcode_output))
+
+print(f"\nExecution Complete! Universal non-planar G-code saved to: {OUTPUT_GCODE}")
